@@ -172,13 +172,17 @@ type HealthCheckArguments struct {
 type PrometheusExporterArguments exporter_mysql.Arguments
 
 func (a *PrometheusExporterArguments) SetToDefault() {
-	*a = PrometheusExporterArguments(exporter_mysql.DefaultArguments)
+	args := exporter_mysql.DefaultArguments
+	args.PerfSchemaEventsStatements.Limit = 100
+	*a = PrometheusExporterArguments(args)
 }
 
 func (a *PrometheusExporterArguments) Validate() error {
 	args := exporter_mysql.Arguments(*a)
 	return args.Validate()
 }
+
+const eventsStatementsCollector = "perf_schema.eventsstatements"
 
 func defaultArguments() Arguments {
 	return Arguments{
@@ -494,10 +498,48 @@ func (c *Component) Update(args component.Arguments) error {
 	}
 
 	c.args = newArgs
+	c.warnOnStatementLimitMismatch()
 	c.fanout.UpdateChildren(c.args.ForwardTo)
 
 	c.replaceInstances(instances)
 	return nil
+}
+
+func (c *Component) warnOnStatementLimitMismatch() {
+	queryDetailsEnabled := enableOrDisableCollectors(c.args)[collector.QueryDetailsCollector]
+	if !queryDetailsEnabled {
+		return
+	}
+
+	usesEmbeddedMySQLExporter := len(c.args.Targets) == 0
+	if !usesEmbeddedMySQLExporter {
+		return
+	}
+
+	exporterArgs := resolveExporterArgs(c.args)
+	if !isExporterCollectorEnabled(exporterArgs, eventsStatementsCollector) {
+		return
+	}
+
+	queryDetailsLimit := c.args.QueryDetailsArguments.StatementsLimit
+	eventsStatementsLimit := exporterArgs.PerfSchemaEventsStatements.Limit
+
+	if queryDetailsLimit != eventsStatementsLimit {
+		c.opts.Logger.Warn(
+			"query_details and prometheus_exporter perf_schema.eventsstatements limits differ",
+			"query_details_limit", queryDetailsLimit,
+			"eventsstatements_limit", eventsStatementsLimit,
+		)
+	}
+}
+
+func isExporterCollectorEnabled(args exporter_mysql.Arguments, name string) bool {
+	for _, scraper := range mysqld_exporter.GetScrapers(args.Convert()) {
+		if scraper.Name() == name {
+			return true
+		}
+	}
+	return false
 }
 
 // buildInstances constructs, but doesn't connect, one dbInstance per config.
@@ -781,10 +823,7 @@ func (c *Component) connectAndStartCollectors(ctx context.Context, inst *dbInsta
 	}
 
 	if len(inst.cfg.targets) == 0 {
-		exporterArgs := exporter_mysql.DefaultArguments
-		if c.args.PrometheusExporter != nil {
-			exporterArgs = exporter_mysql.Arguments(*c.args.PrometheusExporter)
-		}
+		exporterArgs := resolveExporterArgs(c.args)
 		exporterCfg := exporterArgs.Convert()
 		scrapers := mysqld_exporter.GetScrapers(exporterCfg)
 		exporter := mysqld_collector.New(context.Background(), string(inst.cfg.dsn), scrapers, c.opts.Logger,
@@ -826,6 +865,22 @@ func (c *Component) connectAndStartCollectors(ctx context.Context, inst *dbInsta
 	}
 
 	return nil
+}
+
+func resolveExporterArgs(args Arguments) exporter_mysql.Arguments {
+	exporterArgs := exporter_mysql.DefaultArguments
+	exporterArgs.PerfSchemaEventsStatements.Limit = 100 // explicit 100 limit otherwise it'll be 250
+
+	if args.PrometheusExporter != nil {
+		exporterArgs = exporter_mysql.Arguments(*args.PrometheusExporter)
+	}
+	if len(exporterArgs.SetCollectors) == 0 {
+		exporterArgs.SetCollectors = []string{eventsStatementsCollector}
+	}
+	if exporterArgs.PerfSchemaEventsStatements.Limit == 0 {
+		exporterArgs.PerfSchemaEventsStatements.Limit = 100
+	}
+	return exporterArgs
 }
 
 func enableOrDisableCollectors(a Arguments) map[string]bool {
